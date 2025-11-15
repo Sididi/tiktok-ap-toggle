@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# usage: tiktok-ap-toggle iphone8 | mi10t | iphone11 | off | status
+# - Uplink strict : tether USB (Poco X7)
+# - Watchdog : stop AP dès que le tether tombe
+# - PBR durci : aucune fuite vers la box (hard-fail)
+# - Persist IP 4G : confirmation si l’IP publique 4G n’a pas changé
+# - Résidentiel bloqué : protège contre une IP fixe (RESIDENTIAL_UPLINK_BLOCK_IPS)
+# - Standalone : table 200 uniquement, pas de modif système
+set -euo pipefail
+
+# ====== VARIABLES ======
+CONF="$HOME/.local/share/ap-inter/ap-secrets.conf"
+LOG="/tmp/create_ap.log"
+TABLE_ID=200               # table PBR numérique
+STATE_DIR="$HOME/.local/state/ap-inter"
+LAST_IP_FILE="$STATE_DIR/last_uplink_ip.txt"
+
+# ====== UTILS ======
+die(){ echo "Error: $*" >&2; exit 1; }
+warn(){ echo "WARN: $*" >&2; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "commande manquante: $1"; }
+notify(){
+  # $1 = title, $2 = body
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "$1" "$2" || true
+  else
+    warn "notify-send indisponible, notification ignorée"
+  fi
+}
+
+need ip; need iw; need sudo; need create_ap; need curl
+[[ -f "$CONF" ]] || die "Config absente: $CONF"
+mkdir -p "$STATE_DIR"
+
+# shellcheck disable=SC1090
+source "$CONF"
+
+# ---------- helpers ----------
+is_usb_iface(){
+  local ifc="$1" path
+  path=$(readlink -f "/sys/class/net/$ifc/device" 2>/dev/null || true)
+  [[ -n "$path" && "$path" == *"/usb"* ]]
+}
+
+driver_of(){
+  local ifc="$1" drv=""
+  if command -v ethtool >/dev/null 2>&1; then
+    drv=$(ethtool -i "$ifc" 2>/dev/null | awk -F': ' '/driver:/ {print $2}')
+  fi
+  if [[ -z "$drv" && -L "/sys/class/net/$ifc/device/driver" ]]; then
+    drv=$(basename "$(readlink -f "/sys/class/net/$ifc/device/driver")")
+  fi
+  echo "$drv"
+}
+
+is_tether_driver(){
+  case "$1" in
+    rndis_host|cdc_ncm|cdc_ether|usbnet) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_ap_iface(){
+  if [[ -n "${AP_IFACE:-}" ]]; then echo "$AP_IFACE"; return; fi
+  iw dev | awk '/Interface/ {print $2; exit}'
+}
+
+is_residential_blocked_ip(){
+  local ip="$1"
+  local raw="${RESIDENTIAL_UPLINK_BLOCK_IPS:-}"
+  [[ -z "${raw//[[:space:]]/}" ]] && return 1
+  local -a entries
+  local IFS=','
+  read -r -a entries <<< "$raw"
+  local entry
+  for entry in "${entries[@]}"; do
+    entry="${entry//[[:space:]]/}"
+    [[ -z "$entry" ]] && continue
+    [[ "$ip" == "$entry" ]] && return 0
+  done
+  return 1
+}
+
+detect_uplink(){
+  if [[ -n "${UPLINK_IF_FORCE:-}" ]]; then
+    local f="$UPLINK_IF_FORCE"
+    [[ -d "/sys/class/net/$f" ]] || die "UPLINK_IF_FORCE='$f' introuvable"
+    is_usb_iface "$f" || die "UPLINK_IF_FORCE='$f' n'est pas une interface USB"
+    local drv; drv=$(driver_of "$f")
+    if ! is_tether_driver "$drv"; then
+      warn "driver '$drv' non reconnu comme tether USB (rndis_host/cdc_ncm/cdc_ether), on continue."
+    fi
+    echo "$f"; return
+  fi
+  local candidates
+  candidates=$(ip -o -4 route show default | awk '{print $5}' | sort -u)
+  for ifc in $candidates; do
+    [[ "$ifc" == "lo" || "$ifc" == "$AP_IFACE" ]] && continue
+    is_usb_iface "$ifc" || continue
+    local drv; drv=$(driver_of "$ifc")
+    is_tether_driver "$drv" || continue
+    echo "$ifc"; return
+  done
+  return 1
+}
+
+# --- IP publique via l'uplink USB ---
+get_public_ip(){
+  local ip=""
+  for url in https://api.ipify.org https://ifconfig.me https://icanhazip.com; do
+    ip=$(curl -sS --connect-timeout 5 --max-time 8 --interface "$UPLINK_IF" "$url" 2>/dev/null || true)
+    ip="${ip//[[:space:]]/}"
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$ip" =~ : ]]; then
+      echo "$ip"; return 0
+    fi
+  done
+  return 1
+}
+
+# --- PBR: trafic du LAN AP -> table $TABLE_ID -> uplink USB ---
+pbr_setup(){
+  local ap_net gw
+  for _ in {1..5}; do
+    ap_net=$(ip -4 addr show dev "$AP_IFACE" | awk '/inet /{print $2; exit}' || true)
+    [[ -n "$ap_net" ]] && break
+    sleep 1
+  done
+  [[ -n "$ap_net" ]] || { echo "PBR: impossible de détecter le réseau AP (IP manquante sur $AP_IFACE)"; return 1; }
+
+  gw=$(ip route | awk -v IF="$UPLINK_IF" '/^default/ && $5==IF {print $3; exit}')
+
+  sudo ip rule add from "$ap_net" table "$TABLE_ID" priority 1000 2>/dev/null || true
+  if [[ -n "$gw" ]]; then
+    sudo ip route replace default via "$gw" dev "$UPLINK_IF" table "$TABLE_ID"
+  else
+    sudo ip route replace default dev "$UPLINK_IF" table "$TABLE_ID"
+  fi
+  sudo ip rule add from "$ap_net" unreachable priority 2000 2>/dev/null || true
+}
+
+pbr_cleanup(){
+  local ap_net
+  ap_net=$(ip -4 addr show dev "$AP_IFACE" | awk '/inet /{print $2; exit}' || true)
+  [[ -n "$ap_net" ]] && {
+    sudo ip rule del from "$ap_net" table "$TABLE_ID" 2>/dev/null || true
+    sudo ip rule del from "$ap_net" unreachable priority 2000 2>/dev/null || true
+  }
+  sudo ip route flush table "$TABLE_ID" 2>/dev/null || true
+}
+
+# --- ARRÊT PROPRE DE create_ap + RESTAURATION NM/WIFI ---
+kill_create_ap(){
+  # stop propre si supporté (ne log pas s'il échoue)
+  if sudo create_ap --stop "$AP_IFACE" >/dev/null 2>&1; then
+    return 0
+  fi
+  # fallback
+  sudo pkill -f "create_ap.*${AP_IFACE}" >/dev/null 2>&1 || true
+}
+
+restore_wifi_iface(){
+  # purge directive persistante unmanaged-devices si présente
+  if grep -q "unmanaged-devices=interface-name:${AP_IFACE}" /etc/NetworkManager/NetworkManager.conf 2>/dev/null; then
+    sudo sed -i "s/^\s*unmanaged-devices=interface-name:${AP_IFACE}/# unmanaged-devices=interface-name:${AP_IFACE}/" /etc/NetworkManager/NetworkManager.conf || true
+    sudo systemctl restart NetworkManager || true
+  fi
+  # remet l'interface en station côté driver, nettoie l'IP
+  sudo ip addr flush dev "$AP_IFACE" || true
+  sudo ip link set "$AP_IFACE" down || true
+  sudo iw dev "$AP_IFACE" set type managed || true
+  sudo ip link set "$AP_IFACE" up || true
+  # assure que NM gère bien l'interface
+  if command -v nmcli >/dev/null 2>&1; then
+    sudo nmcli device set "$AP_IFACE" managed yes || true
+  fi
+}
+
+# --- Watchdog : coupe le hotspot si le tether tombe ---
+watch_uplink(){
+  local ifc="$UPLINK_IF"
+  echo "[*] Surveillance de l'uplink $ifc (arrêt automatique si déconnecté)"
+  while sleep 3; do
+    if [[ ! -e "/sys/class/net/$ifc" ]]; then
+      notify "Hotspot stoppé" "Uplink $ifc disparu — arrêt pour éviter toute fuite IP"
+      stop_ap
+      exit 0
+    fi
+    if ! ip addr show "$ifc" 2>/dev/null | grep -q "inet "; then
+      notify "Hotspot stoppé" "Uplink $ifc sans IP — arrêt pour éviter toute fuite IP"
+      stop_ap
+      exit 0
+    fi
+  done
+}
+
+# --- Check IP publique 4G et persistance ---
+guard_public_ip_or_prompt(){
+  local current last ans
+  if ! current=$(get_public_ip); then
+    warn "Impossible de récupérer l'IP publique via '$UPLINK_IF' (tether actif ?)."
+    return 1
+  fi
+  if is_residential_blocked_ip "$current"; then
+    echo "IP publique $current identifiée comme résidentielle (${RESIDENTIAL_UPLINK_BLOCK_IPS:-}). Arrêt pour éviter toute fuite."
+    return 1
+  fi
+  if [[ ! -s "$LAST_IP_FILE" ]]; then
+    echo "$current" > "$LAST_IP_FILE"
+    return 0
+  fi
+  last=$(cat "$LAST_IP_FILE" 2>/dev/null || true)
+  if [[ "$current" != "$last" ]]; then
+    echo "$current" > "$LAST_IP_FILE"
+    return 0
+  fi
+  echo "Protection IP 4G : l'IP actuelle ($current) est IDENTIQUE à la dernière utilisée ($last)."
+  if [[ "${AP_TOGGLE_FORCE:-}" == "1" ]]; then
+    echo "AP_TOGGLE_FORCE=1 détecté -> on continue sans confirmation."
+    return 0
+  fi
+  read -r -p "Continuer quand même ? [y/N] " ans
+  case "${ans,,}" in
+    y|yes) echo "$current" > "$LAST_IP_FILE"; return 0 ;;
+    *) echo "Annulé par l'utilisateur."; return 2 ;;
+  esac
+}
+
+start_ap(){
+  local ssid="$1" psk="$2" label="$3"
+
+  AP_IFACE="$(detect_ap_iface)"; [[ -n "$AP_IFACE" ]] || die "Impossible de détecter l'interface AP"
+  if ! UPLINK_IF="$(detect_uplink)"; then
+    die "Aucun uplink tether USB détecté (Poco X7). Active le tethering et réessaie."
+  fi
+
+  # Protection IP publique 4G avant démarrage
+  if ! ip addr show "$UPLINK_IF" | grep -q "inet "; then
+    die "L'interface uplink '$UPLINK_IF' n'a pas d'IP (tether actif ?)"
+  fi
+  if ! guard_public_ip_or_prompt; then exit 1; fi
+
+  echo "[*] Démarrage AP '${ssid}' sur ${AP_IFACE}, uplink=${UPLINK_IF}"
+  notify "Hotspot en démarrage" "Profil: ${label} • Uplink: ${UPLINK_IF}"
+
+  # Laisser create_ap gérer NM; on s'assure juste que l'iface est up
+  kill_create_ap
+  sudo iw reg set "${COUNTRY:-FR}" || true
+  sudo ip link set "$AP_IFACE" down || true
+  sudo ip link set "$AP_IFACE" up || true
+
+  local cmd=(sudo create_ap "$AP_IFACE" "$UPLINK_IF" "$ssid" "$psk" \
+             --no-virt --isolate-clients --country "${COUNTRY:-FR}")
+  [[ -n "${FREQ_MHZ:-}" ]] && cmd+=(--freq "${FREQ_MHZ}")
+  [[ -n "${DHCP_DNS:-}" ]] && cmd+=(--dhcp-dns "${DHCP_DNS}")
+
+  printf "%q " "${cmd[@]}" > "$LOG"; echo >> "$LOG"
+  nohup "${cmd[@]}" >>"$LOG" 2>&1 & disown
+
+  sleep 1
+  if ! pgrep -f "create_ap.*${AP_IFACE}" >/dev/null; then
+    echo "[-] create_ap ne tourne pas (voir $LOG)"; exit 1
+  fi
+
+  pbr_setup || warn "PBR non appliqué"
+
+  echo "[+] AP lancé. Logs: $LOG"
+  notify "Hotspot activé" "Profil: ${label} • AP_IFACE: ${AP_IFACE}"
+
+  sleep 2
+  watch_uplink &
+}
+
+stop_ap(){
+  echo "[*] Arrêt AP"
+  pbr_cleanup
+  kill_create_ap
+  restore_wifi_iface
+  notify "Hotspot arrêté" "AP désactivé, NM restauré, PBR nettoyé"
+  echo "[+] AP arrêté"
+}
+
+status_ap(){
+  local uplink_guess="(none)"
+  if uplink_guess="$(detect_uplink 2>/dev/null)"; then :; fi
+  echo "AP_IFACE : ${AP_IFACE:-$(detect_ap_iface)}"
+  echo "UPLINK_IF (détecté) : ${uplink_guess}"
+  echo
+  echo "== create_ap process =="; ps aux | grep -E "create_ap .*${AP_IFACE}" | grep -v grep || true
+  echo
+  echo "== ip rule =="; ip rule | sed -n '1,200p'
+  echo
+  echo "== table $TABLE_ID =="; ip route show table "$TABLE_ID"
+  echo
+  echo "== Dernières lignes de $LOG =="; tail -n 40 "$LOG" 2>/dev/null || true
+  echo
+  if [[ -s "$LAST_IP_FILE" ]]; then
+    echo "Dernière IP 4G enregistrée : $(cat "$LAST_IP_FILE")"
+  else
+    echo "Aucune IP 4G enregistrée pour l’instant."
+  fi
+}
+
+case "${1:-}" in
+  iphone8)  start_ap "${SSID_IPHONE8}" "${PSK_IPHONE8}" "iPhone 8" ;;
+  mi10t)    start_ap "${SSID_MI10T}"   "${PSK_MI10T}"   "Mi 10T"   ;;
+  iphone11) start_ap "${SSID_IPHONE11}" "${PSK_IPHONE11}" "iPhone 11" ;;
+  off)      stop_ap ;;
+  status)   status_ap ;;
+  *) echo "Usage: $0 iphone8 | mi10t | iphone11 | off | status"; exit 1 ;;
+esac
