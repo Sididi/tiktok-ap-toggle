@@ -1,0 +1,8 @@
+# Ignore local runtime state and secret files (use .local for private overrides)
+share/ap-inter/ap-secrets.conf.local
+
+# keep standard OS/IDE temps out
+.DS_Store
+*.swp
+*.swo
+__pycache__/
